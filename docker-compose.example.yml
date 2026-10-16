@@ -1,0 +1,14 @@
+services:
+  hyakinthosbot:
+      build: .
+      environment:
+        - DISCORD_TOKEN=${DISCORD_TOKEN}
+        - LAVALINK_HOST=${LAVALINK_HOST}
+        - LAVALINK_PASSWORD=${LAVALINK_PASSWORD}
+        - LAVALINK_SSL=${LAVALINK_SSL}
+        - BOT_PREFIX=${BOT_PREFIX}
+      container_name:
+      hyakinthosbot
+          restart: unless-stopped
+      volumes:
+        - ./config.yml:/app/config.yml:ro
