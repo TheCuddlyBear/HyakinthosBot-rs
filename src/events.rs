@@ -19,7 +19,7 @@ pub async fn message_event(ctx: &serenity::Context, event: &serenity::FullEvent,
             return;
         }
 
-        if rand::random_range(1..=100) > 10 {
+        if rand::random_range(1..=100) > 3 {
             return;
         }
 
