@@ -12,6 +12,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+candle-core = "0.8"
+candle-nn = "0.8"
+regex = "1.10"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
 [dependencies.poise]
 version = "0.6"

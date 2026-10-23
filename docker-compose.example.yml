@@ -7,8 +7,10 @@ services:
         - LAVALINK_PASSWORD=${LAVALINK_PASSWORD}
         - LAVALINK_SSL=${LAVALINK_SSL}
         - BOT_PREFIX=${BOT_PREFIX}
-      container_name:
-      hyakinthosbot
-          restart: unless-stopped
+        - REPLY_CHANCE=${REPLY_CHANCE}
+
+      container_name: hyakinthosbot
+      restart: unless-stopped
       volumes:
-        - ./config.yml:/app/config.yml:ro
+        - ./discord_mini_gpt.safetensors:/app/discord_mini_gpt.safetensors:ro
+        - ./discord_tokenizer.json:/app/discord_tokenizer.json:ro

@@ -1,47 +1,12 @@
-use std::vec;
-
 use lavalink_rs::{hook, model::events, prelude::*};
 use poise::serenity_prelude::{ChannelId, Http};
-use poise::serenity_prelude as serenity;
-use rand::prelude::IndexedRandom;
 use tracing::{debug, info};
+
 
 #[hook]
 pub async fn raw_event(_: LavalinkClient, session_id: String, event: &serde_json::Value) {
     if event["op"].as_str() == Some("event") || event["op"].as_str() == Some("playerUpdate") {
         debug!("{:?} -> {:?}", session_id, event);
-    }
-}
-
-pub async fn message_event(ctx: &serenity::Context, event: &serenity::FullEvent,) {
-    if let serenity::FullEvent::Message { new_message } = event {
-        if new_message.author.bot{
-            return;
-        }
-
-        if rand::random_range(1..=100) > 3 {
-            return;
-        }
-
-        let messages = vec![
-            "Gekke {}",
-            "Dikke {}",
-            "Facking {}",
-            "{} jij bent echt een hacker",
-            "Love",
-            "Kale",
-            "Een appel, een ei, een poep en een scheet"
-        ];
-
-        let response = {
-            messages
-                .choose(&mut rand::rng())
-                .map(|message| message.replace("{}", &new_message.author.display_name()))
-        };
-
-        if let Some(response) = response {
-            let _ = new_message.reply(&ctx.http, response).await;
-        }
     }
 }
 

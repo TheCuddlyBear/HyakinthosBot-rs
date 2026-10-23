@@ -1,13 +1,24 @@
 pub mod commands;
 pub mod events;
+pub mod message;
 
 use lavalink_rs::{model::events as lava_events, prelude::*};
 use poise::serenity_prelude as serenity;
 use songbird::SerenityInit;
-use tracing::info;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::OnceCell;
+use tracing::{error, info, warn};
 
 pub struct Data {
-    pub lavalink: LavalinkClient,
+    pub lavalink: Arc<OnceCell<LavalinkClient>>,
+    pub prefix: String,
+}
+
+impl Data {
+    pub fn lavalink(&self) -> Option<LavalinkClient> {
+        self.lavalink.get().cloned()
+    }
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -24,6 +35,12 @@ async fn main() -> Result<(), Error> {
         )
         .init();
 
+    // Preload the MiniDiscordGPT model on startup.
+    let _ = tokio::task::spawn_blocking(|| {
+        let _ = message::get_brain();
+    })
+    .await;
+
     let guild = serenity::GuildId::new(851831355229601844);
 
     let discord_token =
@@ -36,6 +53,7 @@ async fn main() -> Result<(), Error> {
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
     let prefix = std::env::var("BOT_PREFIX").unwrap_or_else(|_| "!".to_string());
+    let setup_prefix = prefix.clone();
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -48,9 +66,9 @@ async fn main() -> Result<(), Error> {
                 commands::volume(),
                 commands::pause(),
             ],
-            event_handler: |ctx, event, _framework_ctx, _data|  {
+            event_handler: |ctx, event, _framework_ctx, data| {
                 Box::pin(async move {
-                    events::message_event(&ctx, event).await;
+                    message::message_event(ctx, event, &data.prefix).await;
                     Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                 })
             },
@@ -63,38 +81,81 @@ async fn main() -> Result<(), Error> {
         .setup(move |ctx, ready, framework| {
             Box::pin(async move {
                 info!("Logged in as {}", ready.user.name);
-                // poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                poise::builtins::register_in_guild(
-                    ctx,
-                    &framework.options().commands,
-                    guild,
-                ).await?;
 
-                let events = lava_events::Events {
-                    raw: Some(events::raw_event),
-                    ready: Some(events::ready_event),
-                    track_start: Some(events::track_start),
-                    track_end: Some(events::track_end),
-                    ..Default::default()
-                };
+                // Register slash commands in the configured guild (and any other guilds the bot is in)
+                // without aborting setup if a guild is inaccessible.
+                let mut target_guilds = vec![guild];
+                for g in &ready.guilds {
+                    if !target_guilds.contains(&g.id) {
+                        target_guilds.push(g.id);
+                    }
+                }
+                for g_id in target_guilds {
+                    if let Err(err) =
+                        poise::builtins::register_in_guild(ctx, &framework.options().commands, g_id)
+                            .await
+                    {
+                        warn!("Could not register commands in guild {}: {}", g_id, err);
+                    }
+                }
 
-                let node_local = NodeBuilder {
-                    hostname: lavalink_host,
-                    is_ssl: lavalink_ssl,
-                    events: lava_events::Events::default(),
-                    password: lavalink_password,
-                    user_id: ctx.cache.current_user().id.into(),
-                    session_id: None,
-                };
+                let bot_user_id: UserId = ctx.cache.current_user().id.into();
+                let lavalink_cell = Arc::new(OnceCell::new());
+                let lavalink_cell_bg = lavalink_cell.clone();
 
-                let client = LavalinkClient::new(
-                    events,
-                    vec![node_local],
-                    NodeDistributionStrategy::round_robin(),
-                )
-                .await;
+                // Connect to Lavalink in the background with a timeout so an unresponsive
+                // Lavalink node NEVER blocks Poise setup, commands, or message events.
+                tokio::spawn(async move {
+                    loop {
+                        let events = lava_events::Events {
+                            raw: Some(events::raw_event),
+                            ready: Some(events::ready_event),
+                            track_start: Some(events::track_start),
+                            track_end: Some(events::track_end),
+                            ..Default::default()
+                        };
 
-                Ok(Data { lavalink: client })
+                        let node_local = NodeBuilder {
+                            hostname: lavalink_host.clone(),
+                            is_ssl: lavalink_ssl,
+                            events: lava_events::Events::default(),
+                            password: lavalink_password.clone(),
+                            user_id: bot_user_id,
+                            session_id: None,
+                        };
+
+                        info!("Connecting to Lavalink node at {}...", lavalink_host);
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            LavalinkClient::new(
+                                events,
+                                vec![node_local],
+                                NodeDistributionStrategy::round_robin(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(client) => {
+                                let _ = lavalink_cell_bg.set(client);
+                                info!("Lavalink client initialized.");
+                                break;
+                            }
+                            Err(_) => {
+                                error!(
+                                    "Timed out connecting to Lavalink at {}. Retrying in 15s...",
+                                    lavalink_host
+                                );
+                                tokio::time::sleep(Duration::from_secs(15)).await;
+                            }
+                        }
+                    }
+                });
+
+                info!("Bot setup complete! Ready to handle commands and messages.");
+                Ok(Data {
+                    lavalink: lavalink_cell,
+                    prefix: setup_prefix,
+                })
             })
         })
         .build();

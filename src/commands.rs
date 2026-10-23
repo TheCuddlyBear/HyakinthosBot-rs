@@ -3,12 +3,23 @@ use futures::{future, stream::StreamExt};
 use lavalink_rs::prelude::*;
 use poise::serenity_prelude::{self as serenity, ChannelId, Http, Mentionable};
 
+/// Helper to get the Lavalink client or inform the user if it is still connecting.
+async fn require_lavalink(ctx: &Context<'_>) -> Result<LavalinkClient, Error> {
+    if let Some(client) = ctx.data().lavalink() {
+        Ok(client)
+    } else {
+        ctx.say("⚠️ The Lavalink music server is not connected yet (check `LAVALINK_HOST`).")
+            .await?;
+        Err("Lavalink client not connected yet".into())
+    }
+}
+
 /// Helper to join the user's voice channel if not already connected.
 async fn ensure_joined(
     ctx: &Context<'_>,
     guild_id: serenity::GuildId,
 ) -> Result<PlayerContext, Error> {
-    let lava_client = ctx.data().lavalink.clone();
+    let lava_client = require_lavalink(ctx).await?;
 
     if let Some(player) = lava_client.get_player_context(guild_id) {
         return Ok(player);
@@ -170,7 +181,9 @@ pub async fn play(
         return Ok(());
     };
 
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        return Ok(());
+    };
 
     let search_query = if let Some(term) = query {
         if term.starts_with("http://") || term.starts_with("https://") {
@@ -217,7 +230,9 @@ pub async fn play_local(
         return Ok(());
     };
 
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        return Ok(());
+    };
     let filename = file.filename.clone();
 
     // Try loading directly from Discord's attachment URL first (Lavalink HTTP source),
@@ -258,7 +273,11 @@ pub async fn play_local(
 #[poise::command(slash_command, prefix_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Command must be used in a server")?;
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        ctx.say("⚠️ The Lavalink music server is not connected yet.")
+            .await?;
+        return Ok(());
+    };
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
         ctx.say("❌ The bot is not connected to a voice channel.")
@@ -282,7 +301,11 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, prefix_command, guild_only)]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Command must be used in a server")?;
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        ctx.say("⚠️ The Lavalink music server is not connected yet.")
+            .await?;
+        return Ok(());
+    };
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
         ctx.say("❌ The bot is not connected to a voice channel.")
@@ -405,7 +428,11 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, prefix_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Command must be used in a server")?;
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        ctx.say("⚠️ The Lavalink music server is not connected yet.")
+            .await?;
+        return Ok(());
+    };
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
         ctx.say("❌ The bot is not connected to a voice channel.")
@@ -432,7 +459,11 @@ pub async fn volume(
     level: u16,
 ) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Command must be used in a server")?;
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        ctx.say("⚠️ The Lavalink music server is not connected yet.")
+            .await?;
+        return Ok(());
+    };
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
         ctx.say("❌ The bot is not connected to a voice channel.")
@@ -458,7 +489,11 @@ pub async fn pause(
     >,
 ) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Command must be used in a server")?;
-    let lava_client = ctx.data().lavalink.clone();
+    let Some(lava_client) = ctx.data().lavalink() else {
+        ctx.say("⚠️ The Lavalink music server is not connected yet.")
+            .await?;
+        return Ok(());
+    };
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
         ctx.say("❌ The bot is not connected to a voice channel.")
