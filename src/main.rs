@@ -28,6 +28,11 @@ pub type Context<'a> = poise::Context<'a, Data, Error>;
 async fn main() -> Result<(), Error> {
     let _ = dotenvy::dotenv();
 
+    // Prevent Rayon thread-pool contention on small matrix multiplies on VPS vCPUs.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        std::env::set_var("RAYON_NUM_THREADS", "1");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

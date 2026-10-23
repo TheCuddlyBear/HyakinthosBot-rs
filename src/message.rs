@@ -42,7 +42,7 @@ impl CausalSelfAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, kv_cache: &mut Option<(Tensor, Tensor)>) -> Result<Tensor> {
         let (b, t, c) = x.dims3()?;
         let qkv = self.qkv.forward(x)?;
 
@@ -62,14 +62,36 @@ impl CausalSelfAttention {
             .transpose(1, 2)?
             .contiguous()?;
 
+        let (k, v) = match kv_cache.take() {
+            Some((prev_k, prev_v)) => {
+                let k = Tensor::cat(&[&prev_k, &k], 2)?;
+                let v = Tensor::cat(&[&prev_v, &v], 2)?;
+                (k, v)
+            }
+            None => (k, v),
+        };
+        *kv_cache = Some((k.clone(), v.clone()));
+
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
-        let mask: Vec<f32> = (0..t)
-            .flat_map(|i| (0..t).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
-            .collect();
-        let mask = Tensor::from_slice(&mask, (1, 1, t, t), x.device())?;
-        att = att.broadcast_add(&mask)?;
+        if t > 1 {
+            let total_t = k.dim(2)?;
+            let offset = total_t - t;
+            let mask: Vec<f32> = (0..t)
+                .flat_map(|i| {
+                    (0..total_t).map(move |j| {
+                        if j > offset + i {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+                .collect();
+            let mask = Tensor::from_slice(&mask, (1, 1, t, total_t), x.device())?;
+            att = att.broadcast_add(&mask)?;
+        }
 
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let out = att
@@ -106,9 +128,9 @@ impl TransformerBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, kv_cache: &mut Option<(Tensor, Tensor)>) -> Result<Tensor> {
         let residual = x;
-        let x = self.attn.forward(&self.ln1.forward(x)?)?;
+        let x = self.attn.forward(&self.ln1.forward(x)?, kv_cache)?;
         let x = (residual + x)?;
 
         let residual = &x;
@@ -124,6 +146,7 @@ pub struct MiniDiscordGPT {
     pos_emb: Embedding,
     blocks: Vec<TransformerBlock>,
     ln_f: LayerNorm,
+    head_weight: Tensor,
     pub max_seq_len: usize,
 }
 
@@ -140,30 +163,40 @@ impl MiniDiscordGPT {
             )?);
         }
         let ln_f = layer_norm(D_MODEL, 1e-5, vb.pp("ln_f"))?;
+        let head_weight = tok_emb.embeddings().t()?.contiguous()?;
         Ok(Self {
             tok_emb,
             pos_emb,
             blocks,
             ln_f,
+            head_weight,
             max_seq_len: MAX_SEQ_LEN,
         })
     }
 
-    pub fn forward(&self, idx: &Tensor) -> Result<Tensor> {
+    /// Runs a forward pass starting at position `start_pos`, updating `kv_cache`,
+    /// and returns logits for ONLY the last token of shape `(b, vocab_size)`.
+    pub fn forward_last_logits(
+        &self,
+        idx: &Tensor,
+        start_pos: usize,
+        kv_cache: &mut [Option<(Tensor, Tensor)>],
+    ) -> Result<Tensor> {
         let (_b, t) = idx.dims2()?;
-        let pos = Tensor::arange(0u32, t as u32, idx.device())?;
+        let pos = Tensor::arange(start_pos as u32, (start_pos + t) as u32, idx.device())?;
 
         let tok_embeddings = self.tok_emb.forward(idx)?;
         let pos_embeddings = self.pos_emb.forward(&pos)?;
         let mut x = tok_embeddings.broadcast_add(&pos_embeddings)?;
 
-        for block in &self.blocks {
-            x = block.forward(&x)?;
+        for (block, cache) in self.blocks.iter().zip(kv_cache.iter_mut()) {
+            x = block.forward(&x, cache)?;
         }
-        x = self.ln_f.forward(&x)?;
 
-        let head_weight = self.tok_emb.embeddings().t()?;
-        let logits = x.broadcast_matmul(&head_weight)?;
+        // Only project the final token's hidden state to vocabulary logits!
+        let x_last = x.narrow(1, t - 1, 1)?;
+        let x_last = self.ln_f.forward(&x_last)?;
+        let logits = x_last.broadcast_matmul(&self.head_weight)?.squeeze(1)?;
         Ok(logits)
     }
 }
@@ -288,28 +321,43 @@ pub fn generate_take(
     }
 
     let prompt_len = prompt_ids.len();
-    let mut sequences: Vec<Vec<u32>> = vec![prompt_ids; num_candidates];
+    let mut sequences: Vec<Vec<u32>> = vec![prompt_ids.clone(); num_candidates];
     let mut finished = vec![false; num_candidates];
     let mut log_probs_sum = vec![0.0f32; num_candidates];
     let mut lengths = vec![0usize; num_candidates];
+    let mut kv_cache: Vec<Option<(Tensor, Tensor)>> = vec![None; N_LAYERS];
 
     let mut rng = rand::rng();
 
     for step in 0..max_new_tokens {
         let cur_len = sequences[0].len();
-        let start_idx = cur_len.saturating_sub(model.max_seq_len);
-        let window_len = cur_len - start_idx;
+        if cur_len > model.max_seq_len {
+            break;
+        }
 
-        let flat_input: Vec<u32> = sequences
-            .iter()
-            .flat_map(|seq| &seq[start_idx..])
-            .copied()
-            .collect();
-        let idx_cond = Tensor::from_vec(flat_input, (num_candidates, window_len), device)?;
+        let logits_vec: Vec<Vec<f32>> = if step == 0 {
+            // Prefill the shared prompt ONCE (batch_size = 1), then replicate the KV cache
+            let idx_cond = Tensor::from_vec(prompt_ids.clone(), (1, prompt_len), device)?;
+            let last_logits = model.forward_last_logits(&idx_cond, 0, &mut kv_cache)?;
+            let single_row: Vec<f32> = last_logits.i(0)?.to_vec1()?;
 
-        let logits = model.forward(&idx_cond)?;
-        let last_logits = logits.i((.., window_len - 1, ..))?;
-        let logits_vec: Vec<Vec<f32>> = last_logits.to_vec2()?;
+            if num_candidates > 1 {
+                for layer_cache in &mut kv_cache {
+                    if let Some((k, v)) = layer_cache.take() {
+                        let k_rep = k.repeat((num_candidates, 1, 1, 1))?;
+                        let v_rep = v.repeat((num_candidates, 1, 1, 1))?;
+                        *layer_cache = Some((k_rep, v_rep));
+                    }
+                }
+            }
+            vec![single_row; num_candidates]
+        } else {
+            // Decode only the single newest token (t = 1) using the KV cache!
+            let last_tokens: Vec<u32> = sequences.iter().map(|seq| *seq.last().unwrap()).collect();
+            let idx_cond = Tensor::from_vec(last_tokens, (num_candidates, 1), device)?;
+            let last_logits = model.forward_last_logits(&idx_cond, cur_len - 1, &mut kv_cache)?;
+            last_logits.to_vec2()?
+        };
 
         for b in 0..num_candidates {
             if finished[b] {
@@ -506,6 +554,8 @@ pub fn generate_take(
 // 3. NON-BLOCKING SERENITY MESSAGE EVENT HANDLER
 // ============================================================================
 
+static GEN_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 pub async fn message_event(ctx: &serenity::Context, event: &serenity::FullEvent, bot_prefix: &str) {
     if let serenity::FullEvent::Message { new_message } = event {
         let content = new_message.content.trim();
@@ -539,6 +589,9 @@ pub async fn message_event(ctx: &serenity::Context, event: &serenity::FullEvent,
         let author_name = new_message.author.display_name().to_string();
 
         tokio::spawn(async move {
+            let Ok(_permit) = GEN_SEMAPHORE.acquire().await else {
+                return;
+            };
             let _typing = msg.channel_id.start_typing(&http);
 
             let generated_result = tokio::task::spawn_blocking(move || {
