@@ -1,2 +1,4 @@
 /target
+/models
+model.safetensors
 .env

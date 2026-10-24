@@ -14,6 +14,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
+ENV RUSTFLAGS="-C target-cpu=native"
 RUN cargo build --release
 
 FROM debian:bookworm-slim

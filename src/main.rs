@@ -40,11 +40,8 @@ async fn main() -> Result<(), Error> {
         )
         .init();
 
-    // Preload the MiniDiscordGPT model on startup.
-    let _ = tokio::task::spawn_blocking(|| {
-        let _ = message::get_brain();
-    })
-    .await;
+    // Ensure the HellGPT model files are downloaded from Hugging Face and preload on startup.
+    message::init_brain().await;
 
     let guild = serenity::GuildId::new(851831355229601844);
 

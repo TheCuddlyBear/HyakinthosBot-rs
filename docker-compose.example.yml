@@ -8,9 +8,10 @@ services:
         - LAVALINK_SSL=${LAVALINK_SSL}
         - BOT_PREFIX=${BOT_PREFIX}
         - REPLY_CHANCE=${REPLY_CHANCE}
+        - HF_MODEL_REPO=${HF_MODEL_REPO:-TheCuddlyBear/HellGPT}
+        - HF_TOKEN=${HF_TOKEN:-}
 
       container_name: hyakinthosbot
       restart: unless-stopped
       volumes:
-        - ./discord_mini_gpt.safetensors:/app/discord_mini_gpt.safetensors:ro
-        - ./discord_tokenizer.json:/app/discord_tokenizer.json:ro
+        - ./models:/app/models
