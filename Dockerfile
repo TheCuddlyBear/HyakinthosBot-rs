@@ -43,6 +43,5 @@ RUN curl -fsSL https://deno.land/install.sh -o /tmp/install-deno.sh \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/HyakinthosBot /usr/local/bin/HyakinthosBot
-COPY config.example.yml ./config.yml
 
 CMD ["/usr/local/bin/HyakinthosBot"]
