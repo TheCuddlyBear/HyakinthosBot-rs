@@ -48,7 +48,8 @@ const EN_WORDS: &[&str] = &[
 ];
 
 // ============================================================================
-// 1. TRANSFORMER MODEL ARCHITECTURE (RMSNorm + RoPE + QK-Norm + SwiGLU)
+// 1. TRANSFORMER MODEL ARCHITECTURE
+//    (RMSNorm + RoPE + Differential Self-Attention + Value Residual + Bilingual Dual-Expert SwiGLU)
 // ============================================================================
 
 struct RmsNorm {
@@ -124,29 +125,65 @@ fn apply_rope(
     Ok(Tensor::stack(&[&out1, &out2], 4)?.reshape((b, n_heads, t, head_dim))?)
 }
 
-struct CausalSelfAttention {
+struct DifferentialSelfAttention {
     qkv: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    sub_norm: RmsNorm,
     proj: Linear,
+    v_alpha: Option<Tensor>,
+    one_minus_v_alpha: Option<Tensor>,
+    lam: Tensor,
+    sub_scale: f64,
     n_heads: usize,
     head_dim: usize,
+    sub_dim: usize,
 }
 
-impl CausalSelfAttention {
-    fn load(vb: VarBuilder, d_model: usize, n_heads: usize) -> Result<Self> {
+impl DifferentialSelfAttention {
+    fn load(vb: VarBuilder, d_model: usize, n_heads: usize, layer_idx: usize) -> Result<Self> {
         let head_dim = d_model / n_heads;
+        let sub_dim = head_dim / 2;
+
         let qkv = linear_no_bias(d_model, 3 * d_model, vb.pp("qkv"))?;
         let q_norm = RmsNorm::load(head_dim, 1e-6, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::load(head_dim, 1e-6, vb.pp("k_norm"))?;
+        let sub_norm = RmsNorm::load(head_dim, 1e-6, vb.pp("sub_norm"))?;
         let proj = linear_no_bias(d_model, d_model, vb.pp("proj"))?;
+
+        let (v_alpha, one_minus_v_alpha) = if layer_idx > 0 {
+            let v_mix = vb.get((1, n_heads, 1, 1), "v_mix")?;
+            let alpha = candle_nn::ops::sigmoid(&v_mix)?;
+            let one_minus = (1.0 - &alpha)?;
+            (Some(alpha), Some(one_minus))
+        } else {
+            (None, None)
+        };
+
+        let lambda_init = 0.8 - 0.6 * (-0.3 * (layer_idx as f64)).exp();
+        let lambda_q1 = vb.get((n_heads, sub_dim), "lambda_q1")?;
+        let lambda_k1 = vb.get((n_heads, sub_dim), "lambda_k1")?;
+        let lambda_q2 = vb.get((n_heads, sub_dim), "lambda_q2")?;
+        let lambda_k2 = vb.get((n_heads, sub_dim), "lambda_k2")?;
+
+        let lam1 = (lambda_q1 * lambda_k1)?.sum(1)?.exp()?;
+        let lam2 = (lambda_q2 * lambda_k2)?.sum(1)?.exp()?;
+        let lam = ((lam1 - lam2)? + lambda_init)?.reshape((1, n_heads, 1, 1))?;
+        let sub_scale = 1.0 - lambda_init;
+
         Ok(Self {
             qkv,
             q_norm,
             k_norm,
+            sub_norm,
             proj,
+            v_alpha,
+            one_minus_v_alpha,
+            lam,
+            sub_scale,
             n_heads,
             head_dim,
+            sub_dim,
         })
     }
 
@@ -156,6 +193,7 @@ impl CausalSelfAttention {
         rope_cos: &Tensor,
         rope_sin: &Tensor,
         start_pos: usize,
+        v0: &mut Option<Tensor>,
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b, t, c) = x.dims3()?;
@@ -178,6 +216,17 @@ impl CausalSelfAttention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
+        // Value Residual: anchor Layer 0 values and blend into deeper layers
+        let v = match (&self.v_alpha, &self.one_minus_v_alpha, v0.as_ref()) {
+            (Some(alpha), Some(one_minus), Some(v0_tensor)) => {
+                (v.broadcast_mul(alpha)? + v0_tensor.broadcast_mul(one_minus)?)?
+            }
+            _ => {
+                *v0 = Some(v.clone());
+                v
+            }
+        };
+
         let q = apply_rope(&q, rope_cos, rope_sin, start_pos)?;
         let k = apply_rope(&k, rope_cos, rope_sin, start_pos)?;
 
@@ -191,8 +240,21 @@ impl CausalSelfAttention {
         };
         *kv_cache = Some((k.clone(), v.clone()));
 
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        // Split Q and K into differential half-heads: (B, n_heads, T, head_dim // 2)
+        let q1 = q.narrow(3, 0, self.sub_dim)?.contiguous()?;
+        let q2 = q.narrow(3, self.sub_dim, self.sub_dim)?.contiguous()?;
+        let k1_t = k
+            .narrow(3, 0, self.sub_dim)?
+            .transpose(2, 3)?
+            .contiguous()?;
+        let k2_t = k
+            .narrow(3, self.sub_dim, self.sub_dim)?
+            .transpose(2, 3)?
+            .contiguous()?;
+
+        let scale = 1.0 / (self.sub_dim as f64).sqrt();
+        let mut att1 = (q1.matmul(&k1_t)? * scale)?;
+        let mut att2 = (q2.matmul(&k2_t)? * scale)?;
 
         if t > 1 {
             let total_t = k.dim(2)?;
@@ -209,12 +271,19 @@ impl CausalSelfAttention {
                 })
                 .collect();
             let mask = Tensor::from_slice(&mask, (1, 1, t, total_t), x.device())?;
-            att = att.broadcast_add(&mask)?;
+            att1 = att1.broadcast_add(&mask)?;
+            att2 = att2.broadcast_add(&mask)?;
         }
 
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let out = att
-            .matmul(&v)?
+        let att1 = candle_nn::ops::softmax_last_dim(&att1)?;
+        let att2 = candle_nn::ops::softmax_last_dim(&att2)?;
+
+        let attn1 = att1.matmul(&v)?;
+        let attn2 = att2.matmul(&v)?;
+
+        let diff = (attn1 - attn2.broadcast_mul(&self.lam)?)?;
+        let out = (self.sub_norm.forward(&diff)? * self.sub_scale)?;
+        let out = out
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, t, c))?;
@@ -223,41 +292,86 @@ impl CausalSelfAttention {
     }
 }
 
-struct SwiGLUMLP {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+struct BilingualSwiGLUMLP {
+    w1_s: Linear,
+    w3_s: Linear,
+    w2_s: Linear,
+    router: Linear,
+    w1_exp0: Linear,
+    w3_exp0: Linear,
+    w2_exp0: Linear,
+    w1_exp1: Linear,
+    w3_exp1: Linear,
+    w2_exp1: Linear,
 }
 
-impl SwiGLUMLP {
+impl BilingualSwiGLUMLP {
     fn load(vb: VarBuilder, d_model: usize) -> Result<Self> {
-        let hidden_dim = ((8 * d_model / 3) + 63) / 64 * 64;
-        let w1 = linear_no_bias(d_model, hidden_dim, vb.pp("w1"))?;
-        let w2 = linear_no_bias(hidden_dim, d_model, vb.pp("w2"))?;
-        let w3 = linear_no_bias(d_model, hidden_dim, vb.pp("w3"))?;
-        Ok(Self { w1, w2, w3 })
+        let shared_dim = ((2 * d_model) + 63) / 64 * 64;
+        let expert_dim = ((2 * d_model / 3) + 63) / 64 * 64;
+
+        let w1_s = linear_no_bias(d_model, shared_dim, vb.pp("w1_s"))?;
+        let w3_s = linear_no_bias(d_model, shared_dim, vb.pp("w3_s"))?;
+        let w2_s = linear_no_bias(shared_dim, d_model, vb.pp("w2_s"))?;
+
+        let router = linear_no_bias(d_model, 2, vb.pp("router"))?;
+        let w1_exp0 = linear_no_bias(d_model, expert_dim, vb.pp("w1_exp0"))?;
+        let w3_exp0 = linear_no_bias(d_model, expert_dim, vb.pp("w3_exp0"))?;
+        let w2_exp0 = linear_no_bias(expert_dim, d_model, vb.pp("w2_exp0"))?;
+
+        let w1_exp1 = linear_no_bias(d_model, expert_dim, vb.pp("w1_exp1"))?;
+        let w3_exp1 = linear_no_bias(d_model, expert_dim, vb.pp("w3_exp1"))?;
+        let w2_exp1 = linear_no_bias(expert_dim, d_model, vb.pp("w2_exp1"))?;
+
+        Ok(Self {
+            w1_s,
+            w3_s,
+            w2_s,
+            router,
+            w1_exp0,
+            w3_exp0,
+            w2_exp0,
+            w1_exp1,
+            w3_exp1,
+            w2_exp1,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.w1.forward(x)?)?;
-        let up = self.w3.forward(x)?;
-        Ok(self.w2.forward(&(gate * up)?)?)
+        let shared_gate = candle_nn::ops::silu(&self.w1_s.forward(x)?)?;
+        let shared_up = self.w3_s.forward(x)?;
+        let shared_out = self.w2_s.forward(&(shared_gate * shared_up)?)?;
+
+        let gates = candle_nn::ops::softmax_last_dim(&self.router.forward(x)?)?;
+        let gate0 = gates.narrow(2, 0, 1)?;
+        let gate1 = gates.narrow(2, 1, 1)?;
+
+        let exp0_gate = candle_nn::ops::silu(&self.w1_exp0.forward(x)?)?;
+        let exp0_up = self.w3_exp0.forward(x)?;
+        let exp0_out = self.w2_exp0.forward(&(exp0_gate * exp0_up)?)?;
+
+        let exp1_gate = candle_nn::ops::silu(&self.w1_exp1.forward(x)?)?;
+        let exp1_up = self.w3_exp1.forward(x)?;
+        let exp1_out = self.w2_exp1.forward(&(exp1_gate * exp1_up)?)?;
+
+        let expert_out = (exp0_out.broadcast_mul(&gate0)? + exp1_out.broadcast_mul(&gate1)?)?;
+        Ok((shared_out + expert_out)?)
     }
 }
 
 struct TransformerBlock {
     ln1: RmsNorm,
-    attn: CausalSelfAttention,
+    attn: DifferentialSelfAttention,
     ln2: RmsNorm,
-    mlp: SwiGLUMLP,
+    mlp: BilingualSwiGLUMLP,
 }
 
 impl TransformerBlock {
-    fn load(vb: VarBuilder, d_model: usize, n_heads: usize) -> Result<Self> {
+    fn load(vb: VarBuilder, d_model: usize, n_heads: usize, layer_idx: usize) -> Result<Self> {
         let ln1 = RmsNorm::load(d_model, 1e-6, vb.pp("ln1"))?;
-        let attn = CausalSelfAttention::load(vb.pp("attn"), d_model, n_heads)?;
+        let attn = DifferentialSelfAttention::load(vb.pp("attn"), d_model, n_heads, layer_idx)?;
         let ln2 = RmsNorm::load(d_model, 1e-6, vb.pp("ln2"))?;
-        let mlp = SwiGLUMLP::load(vb.pp("mlp"), d_model)?;
+        let mlp = BilingualSwiGLUMLP::load(vb.pp("mlp"), d_model)?;
         Ok(Self {
             ln1,
             attn,
@@ -272,12 +386,18 @@ impl TransformerBlock {
         rope_cos: &Tensor,
         rope_sin: &Tensor,
         start_pos: usize,
+        v0: &mut Option<Tensor>,
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = x;
-        let h = self
-            .attn
-            .forward(&self.ln1.forward(x)?, rope_cos, rope_sin, start_pos, kv_cache)?;
+        let h = self.attn.forward(
+            &self.ln1.forward(x)?,
+            rope_cos,
+            rope_sin,
+            start_pos,
+            v0,
+            kv_cache,
+        )?;
         let x = (residual + h)?;
 
         let residual = &x;
@@ -321,6 +441,7 @@ impl MiniDiscordGPT {
                 vb.pp(format!("blocks.{i}")),
                 d_model,
                 n_heads,
+                i,
             )?);
         }
         let ln_f = RmsNorm::load(d_model, 1e-6, vb.pp("ln_f"))?;
@@ -352,9 +473,10 @@ impl MiniDiscordGPT {
     ) -> Result<Tensor> {
         let (_b, t) = idx.dims2()?;
         let mut x = self.tok_emb.forward(idx)?;
+        let mut v0: Option<Tensor> = None;
 
         for (block, cache) in self.blocks.iter().zip(kv_cache.iter_mut()) {
-            x = block.forward(&x, &self.rope_cos, &self.rope_sin, start_pos, cache)?;
+            x = block.forward(&x, &self.rope_cos, &self.rope_sin, start_pos, &mut v0, cache)?;
         }
 
         let x_last = x.narrow(1, t - 1, 1)?;
@@ -433,20 +555,41 @@ fn resolve_hf_token() -> Option<String> {
     }
 }
 
+/// Checks whether a safetensors file header contains the new Differential Attention + Bilingual MoE keys.
+fn safetensors_has_latest_arch(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if bytes.len() < 8 {
+        return false;
+    }
+    let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+    if bytes.len() < 8 + header_len {
+        return false;
+    }
+    let Ok(header_str) = std::str::from_utf8(&bytes[8..8 + header_len]) else {
+        return false;
+    };
+    header_str.contains("lambda_q1") && header_str.contains("w1_exp0")
+}
+
 /// Ensures `config.json`, `tokenizer.json`, and `model.safetensors` from `TheCuddlyBear/HellGPT`
-/// are available locally, downloading them from Hugging Face if missing.
+/// are available locally and match the latest architecture, downloading from Hugging Face if needed.
 pub async fn ensure_hf_model_files() -> std::result::Result<PathBuf, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let required = ["config.json", "tokenizer.json", "model.safetensors"];
 
     // 1. Check current working directory first
-    if required.iter().all(|f| cwd.join(f).is_file()) {
+    if required.iter().all(|f| cwd.join(f).is_file())
+        && safetensors_has_latest_arch(&cwd.join("model.safetensors"))
+    {
         return Ok(cwd);
     }
 
     // 2. Check models/HellGPT directory
     let model_dir = cwd.join(LOCAL_MODEL_DIR);
-    if required.iter().all(|f| model_dir.join(f).is_file()) {
+    let latest_weights_present = safetensors_has_latest_arch(&model_dir.join("model.safetensors"));
+    if required.iter().all(|f| model_dir.join(f).is_file()) && latest_weights_present {
         return Ok(model_dir);
     }
 
@@ -459,7 +602,7 @@ pub async fn ensure_hf_model_files() -> std::result::Result<PathBuf, String> {
 
     for filename in required {
         let dest = model_dir.join(filename);
-        if dest.is_file() {
+        if dest.is_file() && latest_weights_present {
             continue;
         }
 
@@ -1180,25 +1323,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hellgpt_matches_python_and_generates() {
+    fn test_hellgpt_diff_attn_and_bilingual_moe() {
         let brain = get_brain().expect("Failed to load HellGPT brain");
         let prompt: Vec<u32> = vec![
             1, 348, 331, 476, 209, 883, 203, 2, 2355, 376, 271, 1135, 360, 2, 473, 211, 257, 408,
             298, 511, 2, 5,
         ];
+
+        // 1. Full prefill forward pass
         let mut kv_cache = vec![None; brain.model.n_layers];
         let idx = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &brain.device).unwrap();
-        let logits = brain
+        let logits_full = brain
             .model
             .forward_last_logits(&idx, 0, &mut kv_cache)
             .unwrap();
-        let row: Vec<f32> = logits.i(0).unwrap().to_vec1().unwrap();
+        let row_full: Vec<f32> = logits_full.i(0).unwrap().to_vec1().unwrap();
 
-        // Compare against PyTorch reference values:
-        // id=83: 11.656191, id=442: 9.806259, id=51: 9.509355
-        assert!((row[83] - 11.656191).abs() < 1e-3, "got {}", row[83]);
-        assert!((row[442] - 9.806259).abs() < 1e-3, "got {}", row[442]);
-        assert!((row[51] - 9.509355).abs() < 1e-3, "got {}", row[51]);
+        // 2. Verify KV-cached incremental decoding produces identical logits to full forward pass
+        let mut kv_step = vec![None; brain.model.n_layers];
+        let prefix_len = prompt.len() - 1;
+        let idx_prefix =
+            Tensor::from_vec(prompt[..prefix_len].to_vec(), (1, prefix_len), &brain.device)
+                .unwrap();
+        let _ = brain
+            .model
+            .forward_last_logits(&idx_prefix, 0, &mut kv_step)
+            .unwrap();
+        let idx_last =
+            Tensor::from_vec(vec![*prompt.last().unwrap()], (1, 1), &brain.device).unwrap();
+        let logits_step = brain
+            .model
+            .forward_last_logits(&idx_last, prefix_len, &mut kv_step)
+            .unwrap();
+        let row_step: Vec<f32> = logits_step.i(0).unwrap().to_vec1().unwrap();
+
+        for i in 0..row_full.len() {
+            assert!(
+                (row_full[i] - row_step[i]).abs() < 1e-3,
+                "KV cache mismatch at token {i}: full={} vs step={}",
+                row_full[i],
+                row_step[i]
+            );
+        }
+
+        let mut indexed: Vec<(usize, f32)> = row_full.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (id, val) in indexed.iter().take(5) {
+            println!("Top logit id={id}: {val:.6}");
+        }
+
+        // Verify exact numerical match against PyTorch reference values:
+        // id=1577 ('maar'): 7.827430, id=89 ('s'): 7.766787, id=84 ('n'): 7.240003
+        assert!((row_full[1577] - 7.827430).abs() < 1e-3, "got {}", row_full[1577]);
+        assert!((row_full[89] - 7.766787).abs() < 1e-3, "got {}", row_full[89]);
+        assert!((row_full[84] - 7.240003).abs() < 1e-3, "got {}", row_full[84]);
 
         let turns = vec![
             "ik heb echt honger".to_string(),
